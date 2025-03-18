@@ -1,12 +1,23 @@
+import copy
+import json
 import logging
 import os
 from functools import cached_property
 from operator import itemgetter
 from typing import Any, Dict, List, Optional, Tuple, Union
+import time
+import asyncio
 
 from lm_eval.api.registry import register_model
-from lm_eval.models.api_models import TemplateAPI
+from lm_eval.models.api_models import TemplateAPI, JsonChatStr
 from lm_eval.models.utils import handle_stop_sequences
+import requests
+
+try:
+    from tenacity import RetryError
+    from aiohttp import ClientSession, ClientTimeout, TCPConnector
+except ModuleNotFoundError:
+    pass
 
 
 eval_logger = logging.getLogger(__name__)
@@ -184,6 +195,194 @@ class LocalChatCompletion(LocalCompletionsAPI):
         raise NotImplementedError(
             "Loglikelihood is not supported for chat completions. Consider using the completions API instead."
         )
+    
+
+@register_model("local-reasoning-completions")
+class LocalReasoningCompletion(LocalChatCompletion):
+    def __init__(
+        self,
+        base_url=None,
+        tokenizer_backend=None,
+        tokenized_requests=False,
+        **kwargs,
+    ):
+        super().__init__(
+            base_url=base_url,
+            tokenizer_backend=tokenizer_backend,
+            tokenized_requests=tokenized_requests,
+            **kwargs,
+        )
+    
+    def _create_payload(
+        self,
+        messages: List[Dict],
+        generate=False,
+        gen_kwargs: dict = None,
+        seed=1234,
+        eos=None,
+        **kwargs,
+    ) -> dict:
+        """Override to add stream=True for streaming support"""
+        payload = super()._create_payload(
+            messages=messages,
+            generate=generate,
+            gen_kwargs=gen_kwargs,
+            seed=seed,
+            eos=eos,
+            **kwargs,
+        )
+        payload["stream"] = True  # Enable streaming
+        payload["stream_options"] = {"include_usage": True}  # Include usage stats
+        return payload
+    
+    def _process_streaming_response(self, response):
+        """Process a streaming response and build the final response object.
+        
+        This encapsulates all the state tracking in one function, making the code
+        cleaner and easier to maintain.
+        """
+        # Initialize state
+        state = {
+            "reasoning_content": "",
+            "content": "",
+            "choices": [],
+            "usage": None,
+            "created": None,
+            "system_fingerprint": None,
+            "model": self.model,
+            "id": None
+        }
+        
+        # Helper function to process a single chunk
+        def process_chunk(chunk):
+            # Update metadata if available
+            state["created"] = chunk.get('created', state["created"])
+            state["system_fingerprint"] = chunk.get('system_fingerprint', state["system_fingerprint"])
+            state["model"] = chunk.get('model', state["model"])
+            state["id"] = chunk.get('id', state["id"])
+            
+            # Get usage information from the last chunk
+            if chunk.get('usage') is not None:
+                state["usage"] = chunk['usage']
+                
+            # Process content from choices
+            if chunk.get('choices') and len(chunk['choices']) > 0:
+                delta = chunk['choices'][0].get('delta', {})
+                
+                # Collect reasoning content
+                if delta.get('reasoning_content') is not None:
+                    state["reasoning_content"] += delta.get('reasoning_content', '')
+                
+                # Collect regular content
+                if delta.get('content') is not None:
+                    state["content"] += delta.get('content', '')
+                    
+                # Get finish_reason if present
+                finish_reason = chunk['choices'][0].get('finish_reason')
+                if finish_reason and not state["choices"]:
+                    # Initialize choices with finish_reason when we first see it
+                    state["choices"] = [{
+                        "index": chunk['choices'][0].get('index', 0),
+                        "finish_reason": finish_reason,
+                        "logprobs": chunk['choices'][0].get('logprobs')
+                    }]
+        
+        try:
+            # Process each line in the response
+            for line in response.iter_lines():
+                if line:
+                    line = line.decode('utf-8')
+                    if line.startswith('data: '):
+                        line = line[6:]  # Remove 'data: ' prefix
+                        if line == '[DONE]':
+                            break
+                            
+                        try:
+                            chunk = json.loads(line)
+                            process_chunk(chunk)
+                        except json.JSONDecodeError:
+                            continue
+            
+            # Build the final response object
+            combined_content = ""
+            if state["reasoning_content"]:
+                combined_content = f"<think>{state['reasoning_content']}</think>"
+            combined_content += state["content"]
+            
+            # Create a choice with the combined content
+            if not state["choices"]:
+                state["choices"] = [{
+                    "index": 0,
+                    "finish_reason": "stop",
+                    "logprobs": None
+                }]
+            
+            # Add message with the combined content to the first choice
+            state["choices"][0]["message"] = {
+                "content": combined_content,
+                "reasoning_content": state["reasoning_content"],
+                "role": "assistant"
+            }
+            
+            # Construct the final response object
+            return {
+                "choices": state["choices"],
+                "object": "chat.completion",
+                "usage": state["usage"] or {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+                "created": state["created"] or int(time.time()),
+                "system_fingerprint": state["system_fingerprint"],
+                "model": state["model"],
+                "id": state["id"] or f"chatcmpl-{int(time.time())}"
+            }
+        except Exception as e:
+            eval_logger.error(f"Error in _process_streaming_response: {e}")
+    
+    def model_call(
+        self,
+        messages: Union[List[List[int]], List[str], List[JsonChatStr]],
+        *,
+        generate: bool = True,
+        gen_kwargs: Optional[Dict] = None,
+        **kwargs,
+    ) -> Optional[dict]:
+        # !!! Copy: shared dict for each request, need new object !!!
+        gen_kwargs = copy.deepcopy(gen_kwargs)
+        try:
+            payload = self._create_payload(
+                self.create_message(messages),
+                generate=generate,
+                gen_kwargs=gen_kwargs,
+                seed=self._seed,
+                eos=self.eos_string,
+                **kwargs,
+            )
+
+            eval_logger.info(f"Payload: {payload}")
+            
+            # Make the streaming API request with an explicit timeout
+            response = requests.post(
+                self.base_url,
+                json=payload,
+                headers=self.header,
+                verify=self.verify_certificate,
+                stream=True
+            )
+            
+            if not response.ok:
+                eval_logger.warning(
+                    f"API request failed with error message: {response.text}. Retrying..."
+                )
+            response.raise_for_status()
+            
+            # Process the streaming response
+            result = self._process_streaming_response(response)
+            return result
+            
+        except RetryError:
+            eval_logger.error(
+                "API request failed after multiple retries. Please check the API status."
+            )
+            return None
 
 
 @register_model(
