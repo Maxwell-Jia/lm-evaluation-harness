@@ -12,6 +12,8 @@ from lm_eval.api.registry import register_model
 from lm_eval.models.api_models import TemplateAPI, JsonChatStr
 from lm_eval.models.utils import handle_stop_sequences
 import requests
+from openai import OpenAI
+from openai.types.chat import ChatCompletion
 
 try:
     from tenacity import RetryError
@@ -618,3 +620,213 @@ class OpenAIChatCompletion(LocalChatCompletion):
         elif "o3" in self.model:
             output.pop("temperature")
         return output
+
+
+@register_model("openai-reasoning-completions")
+class OpenAIReasoningCompletion(OpenAIChatCompletion):
+    def __init__(
+        self,
+        base_url="https://api.openai.com/v1/chat/completions",
+        tokenizer_backend=None,
+        tokenized_requests=False,
+        **kwargs,
+    ):
+        super().__init__(
+            base_url=base_url,
+            tokenizer_backend=tokenizer_backend,
+            tokenized_requests=tokenized_requests,
+            **kwargs,
+        )
+        self.client = OpenAI(
+            api_key=self.api_key,
+            base_url=self.base_url,
+        )
+    
+    def model_call(
+        self,
+        messages: Union[List[List[int]], List[str], List[JsonChatStr]],
+        *,
+        generate: bool = True,
+        gen_kwargs: Optional[Dict] = None,
+        **kwargs,
+    ) -> Optional[dict]:
+        # !!! Copy: shared dict for each request, need new object !!!
+        gen_kwargs = copy.deepcopy(gen_kwargs)
+        try:
+            payload = self._create_payload(
+                self.create_message(messages),
+                generate=generate,
+                gen_kwargs=gen_kwargs,
+                seed=self._seed,
+                eos=self.eos_string,
+                **kwargs,
+            )
+            
+            # Initialize response structure
+            full_response = {"choices": []}
+            
+            # Create and send streaming request
+            response_stream = self.client.chat.completions.create(**payload, stream=True)
+            
+            # Track each choice_index separately
+            choice_data = {}
+            
+            for chunk in response_stream:
+                for choice in chunk.choices:
+                    choice_index = choice.index
+                    
+                    # Initialize data structure for new choices
+                    if choice_index not in choice_data:
+                        choice_data[choice_index] = {
+                            "reasoning_content": "",
+                            "content": "",
+                            "finish_reason": None
+                        }
+                    
+                    # Record finish_reason if present
+                    if hasattr(choice, "finish_reason") and choice.finish_reason is not None:
+                        choice_data[choice_index]["finish_reason"] = choice.finish_reason
+                    
+                    # Process delta content
+                    if hasattr(choice, "delta"):
+                        if hasattr(choice.delta, "reasoning_content") and choice.delta.reasoning_content is not None:
+                            choice_data[choice_index]["reasoning_content"] += choice.delta.reasoning_content
+                        
+                        if hasattr(choice.delta, "content") and choice.delta.content is not None:
+                            choice_data[choice_index]["content"] += choice.delta.content
+            
+            # Build complete response with all choices
+            for idx, data in choice_data.items():
+                full_response["choices"].append({
+                    "index": idx,
+                    "message": {
+                        "content": data["content"],
+                        "reasoning_content": data["reasoning_content"],
+                        "role": "assistant"
+                    },
+                    "finish_reason": data["finish_reason"] or "stop"
+                })
+            
+            return full_response
+        except Exception as e:
+            eval_logger.error(f"Error in model_call: {e}")
+            return None
+    
+    async def amodel_call(
+        self,
+        session: ClientSession,
+        messages: Union[List[List[int]], List[str], List[JsonChatStr]],
+        *,
+        generate: bool = True,
+        cache_keys: list = None,
+        ctxlens: Optional[List[int]] = None,
+        gen_kwargs: Optional[Dict] = None,
+        **kwargs,
+    ) -> Union[List[str], List[Tuple[float, bool]], None]:
+        """Async version of model_call that handles streaming responses"""
+        # Copy shared dict for each request
+        gen_kwargs = copy.deepcopy(gen_kwargs)
+        
+        try:
+            payload = self._create_payload(
+                self.create_message(messages),
+                generate=generate,
+                gen_kwargs=gen_kwargs,
+                seed=self._seed,
+                eos=self.eos_string,
+                **kwargs,
+            )
+            
+            cache_method = "generate_until" if generate else "loglikelihood"
+            
+            # Initialize response structure
+            full_response = {"choices": []}
+            
+            # Create and send streaming request using the OpenAI client
+            # Run the client.chat.completions.create method in a separate thread
+            # to avoid blocking the event loop
+            response_stream = await asyncio.to_thread(
+                self.client.chat.completions.create,
+                **payload,
+                stream=True
+            )
+            
+            # Track each choice_index separately
+            choice_data = {}
+            
+            # Process the stream - MODIFIED: use regular for loop instead of async for
+            # since Stream object doesn't support async iteration
+            for chunk in response_stream:
+                for choice in chunk.choices:
+                    choice_index = choice.index
+                    
+                    # Initialize data structure for new choices
+                    if choice_index not in choice_data:
+                        choice_data[choice_index] = {
+                            "reasoning_content": "",
+                            "content": "",
+                            "finish_reason": None
+                        }
+                    
+                    # Record finish_reason if present
+                    if hasattr(choice, "finish_reason") and choice.finish_reason is not None:
+                        choice_data[choice_index]["finish_reason"] = choice.finish_reason
+                    
+                    # Process delta content
+                    if hasattr(choice, "delta"):
+                        if hasattr(choice.delta, "reasoning_content") and choice.delta.reasoning_content is not None:
+                            choice_data[choice_index]["reasoning_content"] += choice.delta.reasoning_content
+                        
+                        if hasattr(choice.delta, "content") and choice.delta.content is not None:
+                            choice_data[choice_index]["content"] += choice.delta.content
+            
+            # Build complete response with all choices
+            for idx, data in choice_data.items():
+                full_response["choices"].append({
+                    "index": idx,
+                    "message": {
+                        "content": data["content"],
+                        "reasoning_content": data["reasoning_content"],
+                        "role": "assistant"
+                    },
+                    "finish_reason": data["finish_reason"] or "stop"
+                })
+            
+            # Parse the outputs
+            answers = (
+                self.parse_generations(outputs=full_response)
+                if generate
+                else self.parse_logprobs(
+                    outputs=full_response,
+                    tokens=messages,
+                    ctxlens=ctxlens,
+                )
+            )
+            
+            # Cache results if requested
+            if cache_keys:
+                for res, cache in zip(answers, cache_keys):
+                    self.cache_hook.add_partial(cache_method, cache, res)
+            
+            return answers
+            
+        except Exception as e:
+            eval_logger.error(f"Error in amodel_call: {e}")
+            return None
+        
+    @staticmethod
+    def parse_generations(outputs: Union[Dict, List[Dict]], **kwargs) -> List[str]:
+        res = []
+        if not isinstance(outputs, list):
+            outputs = [outputs]
+        for out in outputs:
+            tmp = [None] * len(out["choices"])
+            for choice in out["choices"]:
+                index = choice["index"]
+                message = choice["message"]
+                if "reasoning_content" in message and message["reasoning_content"]:
+                    tmp[index] = "<think>\n" + message["reasoning_content"] + "\n</think>\n" + message["content"]
+                else:
+                    tmp[index] = message["content"]
+            res = res + tmp
+        return res
