@@ -59,3 +59,18 @@ class MajorityVoteFilter(Filter):
             return vote
 
         return map(lambda r: [select_majority(r)], resps)
+
+
+@register_filter("take_last")
+class TakeLastFilter(Filter):
+    def __init__(self) -> None:
+        """
+        Can define custom behavior here, if an individual instantiation of a Filter class should have state.
+        """
+
+    def apply(self, resps, docs):
+        """
+        Each entry of `resps` is a list of model responses.
+        We select the response that occurs most frequently in each entry of `resps`.
+        """
+        return map(lambda r: r[-1], resps)
